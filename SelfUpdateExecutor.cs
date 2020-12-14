@@ -1,31 +1,39 @@
+#nullable enable
+
 using System;
-using System.Diagnostics;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.IO;
+using System.Linq;
+using SelfUpdateExecutor.Exceptions;
+using Process = System.Diagnostics.Process;
 
 namespace SelfUpdateExecutor
 {
-    class SelfUpdateExecutor
+    public class SelfUpdateExecutor
     {
         /** Constants */
-        const int MillisecondsToWait = 10000; // 10 seconds
-        const string LauncherExeFilename = "\\Renegade X Launcher.exe";
-        const string TargetPathSwitch = "--target=";
-        const string ProcessIDSwitch = "--pid=";
+        private const int ExitProcessTimeoutInMs = 10_000; // 10 seconds
+        private const string LauncherExeFilename = "Renegade X Launcher.exe";
+        private readonly string _applicationLogFilePath;
+        private const string TargetPathSwitch = "--target=";
+        private const string ProcessIdSwitch = "--pid=";
 
-        /**
-         * SelfUpdateExecutor.exe entry point
-         * 
-         * @param args Command-line arguments passed to SelfUpdateExecutor.exe by the Renegade X Launcher.
-         */
-        static void Main(string[] args)
+        private SelfUpdateExecutor()
         {
-            // Setup default values
-            string sourcePath = Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location);
-            string targetPath = "";
-            int processId = 0;
+            _applicationLogFilePath = Path.GetTempFileName();
+        }
 
-            // Process command line arguments
+        /// <summary>
+        /// Executes a launcher update by attempting to apply a launcher update, then restarting the launcher
+        /// </summary>
+        /// <param name="args"></param>
+        public static void Main(string[] args)
+        {
+            string? targetPath = null;
+            int processId = 0;
+            List<string> errors = new List<string>();
+
             foreach (string arg in args)
             {
                 if (arg.StartsWith(TargetPathSwitch))
@@ -37,28 +45,79 @@ namespace SelfUpdateExecutor
                         targetPath = targetPath.Substring(0, targetPath.Length - 1);
                     }
                 }
-                else if (arg.StartsWith(ProcessIDSwitch))
+                else if (arg.StartsWith(ProcessIdSwitch))
                 {
                     // Process processId
-                    processId = Int32.Parse(arg.Substring(ProcessIDSwitch.Length));
+                    processId = int.Parse(arg.Substring(ProcessIdSwitch.Length));
+                    if (processId == 0)
+                        errors.Add("pid should not be empty or 0!");
                 }
                 else
                 {
-                    Error("Unknown argument: " + arg);
+                    errors.Add($"Unknown argument: {arg}");
                 }
             }
 
-            // Execute update
-            if (sourcePath != "" && targetPath != "" && processId != 0)
+            if (errors.Count != 0 || targetPath == null || processId == 0)
             {
-                execute(sourcePath, targetPath, processId);
+                Console.Error.WriteLine(string.Join(Environment.NewLine, errors));
+                Console.Out.WriteLine("Usage: SelfUpdateExecutor.exe --target=<fully_qualified_path> --pid=<processId>");
+                return;
             }
+
+            SelfUpdateExecutor selfUpdateExecutor = new SelfUpdateExecutor();
+            selfUpdateExecutor.TryExecuteLauncherUpdate(targetPath, processId);
         }
 
-        /**
-         * Represents update success/failure
-         */
-        enum SelfUpdateStatus
+        private void TryExecuteLauncherUpdate(string absoluteTarget, int processId)
+        {
+            // Setup default values
+            string? absoluteSourcePath = Path.GetDirectoryName(AppContext.BaseDirectory);
+            SelfUpdateStatus status = SelfUpdateStatus.Success;
+
+            // Execute update
+            if (!string.IsNullOrEmpty(absoluteSourcePath) && !string.IsNullOrEmpty(absoluteTarget) && processId != 0 /*&& Path.IsPathFullyQualified(absoluteTarget)*/)
+            {
+                try
+                {
+                    UpdateLauncher(absoluteSourcePath, absoluteTarget, processId);
+                }
+                catch (Exception e)
+                {
+                    Error(e.Message);
+                    status = e switch
+                    {
+                        { } ex when ex is InsufficientDeletePermissionsException => SelfUpdateStatus.DeletePermissionFailure,
+                        { } ex when ex is InsufficientMovePermissionsException => SelfUpdateStatus.MovePermissionFailure,
+                        { } ex when ex is MoveDirectoryMissingException => SelfUpdateStatus.DirectoryMissingFailure,
+                        { } ex when ex is CannotKillProcessException => SelfUpdateStatus.KillFailure,
+                        _ => SelfUpdateStatus.UnhandledException
+                    };
+                }
+            }
+            else
+            {
+                if (string.IsNullOrEmpty(absoluteSourcePath) || processId != 0)
+                {
+                    Error("pid, or sourcePath was null or empty.");
+                    status = SelfUpdateStatus.InvalidArguments;
+                }
+                else
+                {
+                    string errorMessage = $"The argument supplied by --target was null, empty or not absolute: {absoluteTarget}";
+                    throw new ArgumentException(errorMessage);
+                }
+            }
+
+            // Startup new launcher; failure is irresolvable
+            Directory.SetCurrentDirectory(absoluteTarget);
+            Process.Start($"{absoluteTarget}/{LauncherExeFilename}", $"--patch-result={status} --application-log={_applicationLogFilePath}");
+        }
+
+        /// <summary>
+        ///   Represents update success/failure
+        /// </summary>
+        private enum SelfUpdateStatus
         {
             Success = 0,
             InvalidArguments = 1,
@@ -70,131 +129,75 @@ namespace SelfUpdateExecutor
             UnknownError = 7
         }
 
-        /**
-         * Logs a log message to stdout
-         * 
-         * @param message Log message to write to stdout
-         */
-        static void Log(string message)
+        /// <summary>
+        ///   Logs a log message to stdout
+        /// </summary>
+        /// <param name="message">Log message to write to stdout</param>
+        private void Log(string message)
         {
+            File.AppendAllLines(_applicationLogFilePath, new[] { $"[INFO] {message}" });
             Console.Out.WriteLine(message);
         }
 
-        /**
-         * Logs an error to stderr
-         * 
-         * @param message Error message to write to stderr
-         */
-        static void Error(string message)
+        /// <summary>
+        ///   Logs a log message to stderr
+        /// </summary>
+        /// <param name="message">Log message to write to stderr</param>
+        private void Error(string message)
         {
+            File.AppendAllLines(_applicationLogFilePath, new[] { $"[ERROR] {message}" });
             Console.Error.WriteLine(message);
         }
 
-        /**
-         * Executes a launcher update by attempting to apply a launcher update, then restarting the launcher
-         * 
-         * @param sourcePath Path of the new launcher binaries
-         * @param targetPath Path of the current launcher binaries
-         * @param processId Process ID of the launcher which blocks us from updating
-         */
-        static void execute(string sourcePath, string targetPath, int processId)
+        /// <summary>
+        ///   Executes a launcher update by attempting to apply a launcher update, then restarting the launcher
+        /// </summary>
+        /// <param name="absolutePathOfNewLauncher">Path of the new launcher binaries</param>
+        /// <param name="absoluteTarget">Path of the current launcher binaries</param>
+        /// <param name="processId">Process ID of the launcher which blocks us from updating</param>
+        private void UpdateLauncher(string absolutePathOfNewLauncher, string absoluteTarget, int processId)
         {
+            // Set working directory to the user's temporary folder so that we're not locking any directories.
             Directory.SetCurrentDirectory(Path.GetTempPath());
-            string backupPath = targetPath + "_removeme";
 
+            string absoluteBackupPath = $"{absolutePathOfNewLauncher}_backup";
             // Apply launcher self-update
+
+            WaitForProcess(processId);
+            // Delete backup directory if it still exists from an previous upgrade.
+            DeleteDirectory(absoluteBackupPath);
+            MoveDirectory(absolutePathOfNewLauncher, absoluteBackupPath);
             try
             {
-                SelfUpdateStatus status = apply(sourcePath, targetPath, backupPath, processId);
-
-                if (status == SelfUpdateStatus.Success)
+                MoveDirectory(absoluteTarget, absolutePathOfNewLauncher);
+                DeleteDirectory(absoluteBackupPath);
+            }
+            catch (UnauthorizedAccessException)
+            {
+                // We don't have permission to move the `updatePath` directory, instead move `backupPath` back
+                try
                 {
-                    // Patch applied successfully; delete backup
-                    deleteDirectory(backupPath);
+                    MoveDirectory(absoluteBackupPath, absolutePathOfNewLauncher);
                 }
-                else if (status == SelfUpdateStatus.MovePermissionFailure) {
-                    // Patch failed to apply; try to move backup back (if it exists)
-                    SelfUpdateStatus restoreBackupResult = moveDirectory(backupPath, targetPath);
-                    if (restoreBackupResult != SelfUpdateStatus.Success // Backup failed to restore
-                        && restoreBackupResult != SelfUpdateStatus.DirectoryMissingFailure) // Backup existed
-                    {
-                        // The launcher is stuck in the backup directory. We're up shit creek, and won't be able to restart the launcher. This shouldn't ever happen.
-                        throw new Exception("Backup failed to restore; this should never happen");
-                    }
+                catch
+                {
+                    throw new Exception("Backup failed to restore; this should never happen");
                 }
             }
-            catch (Exception e)
-            {
-                Error("Unhandled exception: " + e.ToString());
-                return;
-            }
-
-            // Startup new launcher; failure is irresolvable
-            Directory.SetCurrentDirectory(targetPath);
-            Process.Start(targetPath + LauncherExeFilename, "--patch-result=" + status);
         }
 
-        /**
-         * Applies a launcher update
-         * 
-         * @param sourcePath Path of the new launcher binaries
-         * @param targetPath Path of the current launcher binaries
-         * @param backupPath Path to backup current launcher binaries to
-         * @param processId Process ID of the launcher which blocks us from updating
-         * @return A status code indicating Success, or some error
-         */
-        static SelfUpdateStatus apply(string sourcePath, string targetPath, string backupPath, int processId)
-        {
-            SelfUpdateStatus result;
-
-            // Wait for launcher to close (failure is fatal)
-            result = waitForProcess(processId);
-            if (result != SelfUpdateStatus.Success)
-            {
-                return result;
-            }
-
-            // Clean up possible left behind files from previous installation attempt (failure is fatal)
-            result = deleteDirectory(backupPath);
-            if (result != SelfUpdateStatus.Success)
-            {
-                return result;
-            }
-
-            // Move away old version (failure is fatal)
-            result = moveDirectory(targetPath, backupPath);
-            if (result != SelfUpdateStatus.Success)
-            {
-                return result;
-            }
-
-            // Move new launcher to target (failure is fatal; this shouldn't ever fail)
-            result = moveDirectory(sourcePath, targetPath);
-            if (result != SelfUpdateStatus.Success)
-            {
-                return result;
-            }
-
-            // Delete old launcher (failure is non-fatal; this shouldn't ever fail)
-            deleteDirectory(backupPath);
-
-            return SelfUpdateStatus.Success;
-        }
-
-        /**
-         * Waits 10 seconds for a process to close gracefully, and then kills the process afterwards if it never closed.
-         * 
-         * @param processId Process ID of the task to wait on
-         * @return KillFailure if the task never ends and we are unable to kill it, Success otherwise
-         */
-        static SelfUpdateStatus waitForProcess(int processId)
+        /// <summary>
+        /// Waits 10 seconds for a process to close gracefully, and then kills the process afterwards if it never closed.
+        /// </summary>
+        /// <param name="processId">Process ID of the task to wait on</param>
+        private void WaitForProcess(int processId)
         {
             // Wait for launcher to close (failure is fatal)
             try
             {
                 Log("Waiting for launcher to close...");
-                var process = Process.GetProcessById(processId);
-                if (!process.WaitForExit(MillisecondsToWait))
+                Process process = Process.GetProcessById(processId);
+                if (!process.WaitForExit(ExitProcessTimeoutInMs))
                 {
                     Log("Launcher hasn't closed gracefully; killing launcher process...");
                     // Process failed to exit gracefully; murder it
@@ -205,22 +208,17 @@ namespace SelfUpdateExecutor
             catch (InvalidOperationException) { } // Process doesn't exist; already closed
             catch (Win32Exception e) // Process couldn't be killed; update failed
             {
-                Error("Unable to kill launcher process: " + e.ToString());
-                return SelfUpdateStatus.KillFailure;
+                throw new CannotKillProcessException($"Unable to kill launcher process", e);
             }
-
             // Process has ended successfully
             Log("Launcher closed; applying update...");
-            return SelfUpdateStatus.Success;
         }
 
-        /**
-         * Deletes a directory, and all of the files in it
-         * 
-         * @param directory Directory to delete
-         * @return DeletePermissionFailure on permission failure, Success otherwise
-         */
-        static SelfUpdateStatus deleteDirectory(string directory)
+        /// <summary>
+        /// Deletes a directory, and all of the files in it
+        /// </summary>
+        /// <param name="directory">Directory to delete</param>
+        private static void DeleteDirectory(string directory)
         {
             try
             {
@@ -228,78 +226,75 @@ namespace SelfUpdateExecutor
                 Directory.Delete(directory, true);
             }
             catch (DirectoryNotFoundException) { } // Directory does not exist
-            catch (UnauthorizedAccessException) // We don't have permission to delete the directory
-            {
-                return SelfUpdateStatus.DeletePermissionFailure;
-            }
-            catch (IOException) // Some other error
+            catch (Exception) // Some other error
             {
                 try
                 {
                     File.Delete(directory); // Try deleting it as a file
                 }
-                catch
+                catch (Exception e)
                 {
-                    return SelfUpdateStatus.DeletePermissionFailure; // We failed due to some obscure permissions issue
+                    throw new InsufficientDeletePermissionsException($"Failed to delete file/directory \"{directory}\"", e);
                 }
             }
-
-            // Directory deleted successfully
-            return SelfUpdateStatus.Success;
         }
 
-        /**
-         * Moves a directory from one place to another
-         * 
-         * @param source Directory to move
-         * @param target Target to move directory to
-         * @return MovePermissionFailure if a permission issue occurs, DirectoryMissingFailure if the directory doesn't exist, Success otherwise
-         */
-        static SelfUpdateStatus moveDirectory(string source, string target)
+        /// <summary>
+        ///   Moves a directory from one place to another
+        /// </summary>
+        /// <param name="absoluteFrom">Directory to move</param>
+        /// <param name="absoluteTo">Target to move directory to</param>
+        private void MoveDirectory(string absoluteFrom, string absoluteTo)
         {
             try
             {
-                // Move the directory
-                Directory.Move(source, target);
+                try
+                {
+                    // Move the directory
+                    Directory.Move(absoluteFrom, absoluteTo);
+                }
+                catch (IOException)
+                {
+                    Log($"Could not move directory \"{absoluteFrom}\" to \"{absoluteTo}\", attempting CopyDirectory instead.");
+                    // We're likely attempting to move across volumes; attempt a copy instead
+                    CopyDirectory(absoluteFrom, absoluteTo);
+                }
             }
-            catch (UnauthorizedAccessException) // We don't have permission to move the directory
+            catch (UnauthorizedAccessException e)
             {
-                return SelfUpdateStatus.MovePermissionFailure;
+                throw new InsufficientMovePermissionsException($"Failed to move file/directory from \"{absoluteFrom}\" to \"{absoluteTo}\"", e);
             }
-            catch (DirectoryNotFoundException) // We're trying to move something that doesn't exist
+            catch (DirectoryNotFoundException e) // We're trying to move something that doesn't exist
             {
-                return SelfUpdateStatus.DirectoryMissingFailure;
+                throw new MoveDirectoryMissingException($"Failed to move file/directory from \"{absoluteFrom}\" to \"{absoluteTo}\"", e);
             }
-            catch (IOException)
-            {
-                // We're likely attempting to move across volumes; attempt a copy instead
-                copyDirectory(source, target);
-                //deleteDirectory(source); // We can't delete the source, because it's a running application.
-            }
-
-            return SelfUpdateStatus.Success;
         }
 
-        static void copyDirectory(string source, string target)
+        /// <summary>
+        ///   Moves a directory from one place to another
+        /// </summary>
+        /// <param name="absoluteFrom">Directory to move</param>
+        /// <param name="absoluteTo">Target to move directory to</param>
+        private static void CopyDirectory(string absoluteFrom, string absoluteTo)
         {
             // Create target directory
-            Directory.CreateDirectory(target);
+            Directory.CreateDirectory(absoluteTo);
 
             // Copy files from source to target
-            var files = Directory.GetFiles(source);
-            foreach (string file in files)
+            List<string> files = Directory.GetFiles(absoluteFrom).ToList();
+            files.ForEach(file =>
             {
-                string filename = System.IO.Path.GetFileName(file);
-                File.Copy(file, target + "\\" + filename, true);
-            }
+                File.Copy(file, $"{absoluteTo}/{Path.GetFileName(file)}", true);
+                File.Delete(file);
+            });
 
             // Copy subdirectories from source to target
-            var directories = Directory.GetDirectories(source);
-            foreach (string directory in directories)
+            List<string> directories = Directory.GetDirectories(absoluteFrom).ToList();
+            directories.ForEach(directory =>
             {
-                string directoryName = System.IO.Path.GetFileName(directory);
-                copyDirectory(directory, target + "\\" + directoryName);
-            }
+                CopyDirectory(directory, $"{absoluteTo}/{Path.GetFileName(directory)}");
+                DeleteDirectory(directory);
+            });
         }
     }
 }
